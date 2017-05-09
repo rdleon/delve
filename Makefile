@@ -2,12 +2,10 @@
 UNAME=$(shell uname)
 PREFIX=github.com/derekparker/delve
 GOVERSION=$(shell go version)
-BUILD_SHA=$(shell git rev-parse HEAD)
+LLDB_SERVER=$(shell which lldb-server)
 
 ifeq "$(UNAME)" "Darwin"
-    BUILD_FLAGS=-ldflags="-s -X main.Build=$(BUILD_SHA)"
-else
-    BUILD_FLAGS=-ldflags="-X main.Build=$(BUILD_SHA)"
+    BUILD_FLAGS=-ldflags="-s"
 endif
 
 # Workaround for GO15VENDOREXPERIMENT bug (https://github.com/golang/go/issues/11659)
@@ -21,6 +19,7 @@ ALL_PACKAGES=$(shell go list ./... | grep -v /vendor/ | grep -v /scripts)
 # See https://github.com/golang/go/issues/11887#issuecomment-126117692.
 ifeq "$(UNAME)" "Darwin"
 	TEST_FLAGS=-exec=$(shell pwd)/scripts/testsign
+	export PROCTEST=lldb
 	DARWIN="true"
 endif
 
@@ -29,7 +28,8 @@ check-cert:
 ifneq "$(TRAVIS)" "true"
 ifdef DARWIN
 ifeq "$(CERT)" ""
-	$(error You must provide a CERT environment variable in order to codesign the binary.)
+	scripts/gencert.sh || (echo "An error occurred when generating and installing a new certicate"; exit 1)
+        CERT = dlv-cert
 endif
 endif
 endif
@@ -37,10 +37,8 @@ endif
 build: check-cert
 	go build $(BUILD_FLAGS) github.com/derekparker/delve/cmd/dlv
 ifdef DARWIN
-ifneq "$(GOBIN)" ""
-	codesign -s "$(CERT)"  $(GOBIN)/dlv
-else
-	codesign -s "$(CERT)"  $(GOPATH)/bin/dlv
+ifdef CERT
+	codesign -s "$(CERT)"  ./dlv
 endif
 endif
 
@@ -64,9 +62,31 @@ endif
 else
 	go test $(TEST_FLAGS) $(BUILD_FLAGS) $(ALL_PACKAGES)
 endif
+ifneq "$(shell which lldb-server)" ""
+	@echo
+	@echo 'Testing LLDB backend (proc)'
+	go test $(TEST_FLAGS) $(BUILD_FLAGS) $(PREFIX)/pkg/proc -backend=lldb 
+	@echo
+	@echo 'Testing LLDB backend (integration)'
+	go test $(TEST_FLAGS) $(BUILD_FLAGS) $(PREFIX)/service/test -backend=lldb
+	@echo
+	@echo 'Testing LLDB backend (terminal)'
+	go test $(TEST_FLAGS) $(BUILD_FLAGS) $(PREFIX)/pkg/terminal -backend=lldb
+endif
+ifneq "$(shell which rr)" ""
+	@echo
+	@echo 'Testing Mozilla RR backend (proc)'
+	go test $(TEST_FLAGS) $(BUILD_FLAGS) $(PREFIX)/pkg/proc -backend=rr
+	@echo
+	@echo 'Testing Mozilla RR backend (integration)'
+	go test $(TEST_FLAGS) $(BUILD_FLAGS) $(PREFIX)/service/test -backend=rr
+	@echo
+	@echo 'Testing Mozilla RR backend (terminal)'
+	go test $(TEST_FLAGS) $(BUILD_FLAGS) $(PREFIX)/pkg/terminal -backend=rr
+endif
 
 test-proc-run:
-	go test $(TEST_FLAGS) $(BUILD_FLAGS) -test.run="$(RUN)" $(PREFIX)/proc
+	go test $(TEST_FLAGS) $(BUILD_FLAGS) -test.v -test.run="$(RUN)" -backend=$(BACKEND) $(PREFIX)/pkg/proc
 
 test-integration-run:
-	go test $(TEST_FLAGS) $(BUILD_FLAGS) -test.run="$(RUN)" $(PREFIX)/service/test
+	go test $(TEST_FLAGS) $(BUILD_FLAGS) -test.run="$(RUN)" -backend=$(BACKEND) $(PREFIX)/service/test

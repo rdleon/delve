@@ -1,6 +1,8 @@
 package service
 
 import (
+	"time"
+
 	"github.com/derekparker/delve/service/api"
 )
 
@@ -10,21 +12,31 @@ type Client interface {
 	// Returns the pid of the process we are debugging.
 	ProcessPid() int
 
+	// LastModified returns the time that the process' executable was modified.
+	LastModified() time.Time
+
 	// Detach detaches the debugger, optionally killing the process.
 	Detach(killProcess bool) error
 
 	// Restarts program.
-	Restart() error
+	Restart() ([]api.DiscardedBreakpoint, error)
+	// Restarts program from the specified position.
+	RestartFrom(pos string) ([]api.DiscardedBreakpoint, error)
 
 	// GetState returns the current debugger state.
 	GetState() (*api.DebuggerState, error)
 
 	// Continue resumes process execution.
 	Continue() <-chan *api.DebuggerState
+	// Rewind resumes process execution backwards.
+	Rewind() <-chan *api.DebuggerState
 	// Next continues to the next source line, not entering function calls.
 	Next() (*api.DebuggerState, error)
 	// Step continues to the next source line, entering function calls.
 	Step() (*api.DebuggerState, error)
+	// StepOut continues to the return address of the current function
+	StepOut() (*api.DebuggerState, error)
+
 	// SingleStep will step a single cpu instruction.
 	StepInstruction() (*api.DebuggerState, error)
 	// SwitchThread switches the current thread context.
@@ -76,7 +88,7 @@ type Client interface {
 	// ListFunctionArgs lists all arguments to the current function.
 	ListFunctionArgs(scope api.EvalScope, cfg api.LoadConfig) ([]api.Variable, error)
 	// ListRegisters lists registers and their values.
-	ListRegisters() (string, error)
+	ListRegisters(threadID int, includeFp bool) (api.Registers, error)
 
 	// ListGoroutines lists all goroutines.
 	ListGoroutines() ([]*api.Goroutine, error)
@@ -104,4 +116,15 @@ type Client interface {
 	DisassembleRange(scope api.EvalScope, startPC, endPC uint64, flavour api.AssemblyFlavour) (api.AsmInstructions, error)
 	// Disassemble code of the function containing PC
 	DisassemblePC(scope api.EvalScope, pc uint64, flavour api.AssemblyFlavour) (api.AsmInstructions, error)
+
+	// Recorded returns true if the target is a recording.
+	Recorded() bool
+	// TraceDirectory returns the path to the trace directory for a recording.
+	TraceDirectory() (string, error)
+	// Checkpoint sets a checkpoint at the current position.
+	Checkpoint(where string) (checkpointID int, err error)
+	// ListCheckpoints gets all checkpoints.
+	ListCheckpoints() ([]api.Checkpoint, error)
+	// ClearCheckpoint removes a checkpoint
+	ClearCheckpoint(id int) error
 }

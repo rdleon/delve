@@ -9,8 +9,9 @@ import (
 	"reflect"
 	"strconv"
 
+	"github.com/derekparker/delve/pkg/proc"
+
 	"golang.org/x/debug/dwarf"
-	"github.com/derekparker/delve/proc"
 )
 
 // ConvertBreakpoint converts from a proc.Breakpoint to
@@ -46,7 +47,7 @@ func ConvertBreakpoint(bp *proc.Breakpoint) *Breakpoint {
 
 // ConvertThread converts a proc.Thread into an
 // api thread.
-func ConvertThread(th *proc.Thread) *Thread {
+func ConvertThread(th proc.Thread) *Thread {
 	var (
 		function *Function
 		file     string
@@ -65,16 +66,16 @@ func ConvertThread(th *proc.Thread) *Thread {
 
 	var bp *Breakpoint
 
-	if th.CurrentBreakpoint != nil && th.BreakpointConditionMet {
-		bp = ConvertBreakpoint(th.CurrentBreakpoint)
+	if b, active, _ := th.Breakpoint(); active {
+		bp = ConvertBreakpoint(b)
 	}
 
-	if g, _ := th.GetG(); g != nil {
+	if g, _ := proc.GetG(th); g != nil {
 		gid = g.ID
 	}
 
 	return &Thread{
-		ID:          th.ID,
+		ID:          th.ThreadID(),
 		PC:          pc,
 		File:        file,
 		Line:        line,
@@ -98,6 +99,19 @@ func prettyTypeName(typ dwarf.Type) string {
 	return r
 }
 
+func convertFloatValue(v *proc.Variable, sz int) string {
+	switch v.FloatSpecial {
+	case proc.FloatIsPosInf:
+		return "+Inf"
+	case proc.FloatIsNegInf:
+		return "-Inf"
+	case proc.FloatIsNaN:
+		return "NaN"
+	}
+	f, _ := constant.Float64Val(v.Value)
+	return strconv.FormatFloat(f, 'f', -1, sz)
+}
+
 // ConvertVar converts from proc.Variable to api.Variable.
 func ConvertVar(v *proc.Variable) *Variable {
 	r := Variable{
@@ -119,11 +133,9 @@ func ConvertVar(v *proc.Variable) *Variable {
 	if v.Value != nil {
 		switch v.Kind {
 		case reflect.Float32:
-			f, _ := constant.Float64Val(v.Value)
-			r.Value = strconv.FormatFloat(f, 'f', -1, 32)
+			r.Value = convertFloatValue(v, 32)
 		case reflect.Float64:
-			f, _ := constant.Float64Val(v.Value)
-			r.Value = strconv.FormatFloat(f, 'f', -1, 64)
+			r.Value = convertFloatValue(v, 64)
 		case reflect.String, reflect.Func:
 			r.Value = constant.StringVal(v.Value)
 		default:
@@ -189,17 +201,17 @@ func ConvertFunction(fn *gosym.Func) *Function {
 
 // ConvertGoroutine converts from proc.G to api.Goroutine.
 func ConvertGoroutine(g *proc.G) *Goroutine {
-	th := g.Thread()
+	th := g.Thread
 	tid := 0
 	if th != nil {
-		tid = th.ID
+		tid = th.ThreadID()
 	}
 	return &Goroutine{
 		ID:             g.ID,
 		CurrentLoc:     ConvertLocation(g.CurrentLoc),
 		UserCurrentLoc: ConvertLocation(g.UserCurrent()),
 		GoStatementLoc: ConvertLocation(g.Go()),
-		ThreadID: tid,
+		ThreadID:       tid,
 	}
 }
 
@@ -253,4 +265,16 @@ func LoadConfigFromProc(cfg *proc.LoadConfig) *LoadConfig {
 		cfg.MaxArrayValues,
 		cfg.MaxStructFields,
 	}
+}
+
+func ConvertRegisters(in []proc.Register) (out []Register) {
+	out = make([]Register, len(in))
+	for i := range in {
+		out[i] = Register{in[i].Name, in[i].Value}
+	}
+	return
+}
+
+func ConvertCheckpoint(in proc.Checkpoint) (out Checkpoint) {
+	return Checkpoint{ID: in.ID, When: in.When, Where: in.Where}
 }

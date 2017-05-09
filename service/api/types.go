@@ -1,13 +1,14 @@
 package api
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"reflect"
 	"strconv"
 	"unicode"
 
-	"github.com/derekparker/delve/proc"
+	"github.com/derekparker/delve/pkg/proc"
 )
 
 var NotExecutableErr = proc.NotExecutableErr
@@ -28,6 +29,8 @@ type DebuggerState struct {
 	// Exited indicates whether the debugged process has exited.
 	Exited     bool `json:"exited"`
 	ExitStatus int  `json:"exitStatus"`
+	// When contains a description of the current position in a recording
+	When string
 	// Filled by RPCClient.Continue, indicates an error
 	Err error `json:"-"`
 }
@@ -235,8 +238,12 @@ type EvalScope struct {
 const (
 	// Continue resumes process execution.
 	Continue = "continue"
+	// Rewind resumes process execution backwards (target must be a recording).
+	Rewind = "rewind"
 	// Step continues to next source line, entering function calls.
 	Step = "step"
+	// StepOut continues to the return address of the current function
+	StepOut = "stepOut"
 	// SingleStep continues for exactly 1 cpu instruction.
 	StepInstruction = "stepInstruction"
 	// Next continues to the next source line, not entering function calls.
@@ -287,4 +294,37 @@ type SetAPIVersionIn struct {
 }
 
 type SetAPIVersionOut struct {
+}
+
+type Register struct {
+	Name  string
+	Value string
+}
+
+type Registers []Register
+
+func (regs Registers) String() string {
+	maxlen := 0
+	for _, reg := range regs {
+		if n := len(reg.Name); n > maxlen {
+			maxlen = n
+		}
+	}
+
+	var buf bytes.Buffer
+	for _, reg := range regs {
+		fmt.Fprintf(&buf, "%*s = %s\n", maxlen, reg.Name, reg.Value)
+	}
+	return buf.String()
+}
+
+type DiscardedBreakpoint struct {
+	Breakpoint *Breakpoint
+	Reason     string
+}
+
+type Checkpoint struct {
+	ID    int
+	When  string
+	Where string
 }

@@ -1,3 +1,5 @@
+// +build ignore
+
 package main
 
 import (
@@ -5,7 +7,7 @@ import (
 	"log"
 	"os"
 
-	"github.com/derekparker/delve/terminal"
+	"github.com/derekparker/delve/pkg/terminal"
 )
 
 func main() {

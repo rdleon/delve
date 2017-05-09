@@ -1,6 +1,7 @@
-package servicetest
+package service_test
 
 import (
+	"flag"
 	"fmt"
 	"math/rand"
 	"net"
@@ -12,9 +13,9 @@ import (
 	"testing"
 	"time"
 
-	protest "github.com/derekparker/delve/proc/test"
+	protest "github.com/derekparker/delve/pkg/proc/test"
 
-	"github.com/derekparker/delve/proc"
+	"github.com/derekparker/delve/pkg/proc"
 	"github.com/derekparker/delve/service"
 	"github.com/derekparker/delve/service/api"
 	"github.com/derekparker/delve/service/rpc2"
@@ -22,12 +23,24 @@ import (
 )
 
 var normalLoadConfig = api.LoadConfig{true, 1, 64, 64, -1}
+var testBackend string
 
 func TestMain(m *testing.M) {
+	flag.StringVar(&testBackend, "backend", "", "selects backend")
+	flag.Parse()
+	if testBackend == "" {
+		testBackend = os.Getenv("PROCTEST")
+		if testBackend == "" {
+			testBackend = "native"
+		}
+	}
 	os.Exit(protest.RunTestsWithFixtures(m))
 }
 
 func withTestClient2(name string, t *testing.T, fn func(c service.Client)) {
+	if testBackend == "rr" {
+		protest.MustHaveRecordingAllowed(t)
+	}
 	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("couldn't start listener: %s\n", err)
@@ -36,6 +49,7 @@ func withTestClient2(name string, t *testing.T, fn func(c service.Client)) {
 	server := rpccommon.NewServer(&service.Config{
 		Listener:    listener,
 		ProcessArgs: []string{protest.BuildFixture(name).Path},
+		Backend:     testBackend,
 	}, false)
 	if err := server.Run(); err != nil {
 		t.Fatal(err)
@@ -43,12 +57,21 @@ func withTestClient2(name string, t *testing.T, fn func(c service.Client)) {
 	client := rpc2.NewClient(listener.Addr().String())
 	defer func() {
 		client.Detach(true)
+		if dir, _ := client.TraceDirectory(); dir != "" {
+			protest.SafeRemoveAll(dir)
+		}
 	}()
 
 	fn(client)
 }
 
 func TestRunWithInvalidPath(t *testing.T) {
+	if testBackend == "rr" {
+		// This test won't work because rr returns an error, after recording, when
+		// the recording failed but also when the recording succeeded but the
+		// inferior returned an error. Therefore we have to ignore errors from rr.
+		return
+	}
 	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("couldn't start listener: %s\n", err)
@@ -58,6 +81,7 @@ func TestRunWithInvalidPath(t *testing.T) {
 		Listener:    listener,
 		ProcessArgs: []string{"invalid_path"},
 		APIVersion:  2,
+		Backend:     testBackend,
 	}, false)
 	if err := server.Run(); err == nil {
 		t.Fatal("Expected Run to return error for invalid program path")
@@ -71,7 +95,7 @@ func TestRestart_afterExit(t *testing.T) {
 		if !state.Exited {
 			t.Fatal("expected initial process to have exited")
 		}
-		if err := c.Restart(); err != nil {
+		if _, err := c.Restart(); err != nil {
 			t.Fatal(err)
 		}
 		if c.ProcessPid() == origPid {
@@ -85,6 +109,7 @@ func TestRestart_afterExit(t *testing.T) {
 }
 
 func TestRestart_breakpointPreservation(t *testing.T) {
+	protest.AllowRecording(t)
 	withTestClient2("continuetestprog", t, func(c service.Client) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main", Line: 1, Name: "firstbreakpoint", Tracepoint: true})
 		assertNoError(err, t, "CreateBreakpoint()")
@@ -124,7 +149,7 @@ func TestRestart_duringStop(t *testing.T) {
 		if state.CurrentThread.Breakpoint == nil {
 			t.Fatal("did not hit breakpoint")
 		}
-		if err := c.Restart(); err != nil {
+		if _, err := c.Restart(); err != nil {
 			t.Fatal(err)
 		}
 		if c.ProcessPid() == origPid {
@@ -147,6 +172,7 @@ func TestRestart_attachPid(t *testing.T) {
 		Listener:   nil,
 		AttachPid:  999,
 		APIVersion: 2,
+		Backend:    testBackend,
 	}, false)
 	if err := server.Restart(); err == nil {
 		t.Fatal("expected error on restart after attaching to pid but got none")
@@ -154,6 +180,7 @@ func TestRestart_attachPid(t *testing.T) {
 }
 
 func TestClientServer_exit(t *testing.T) {
+	protest.AllowRecording(t)
 	withTestClient2("continuetestprog", t, func(c service.Client) {
 		state, err := c.GetState()
 		if err != nil {
@@ -177,8 +204,9 @@ func TestClientServer_exit(t *testing.T) {
 }
 
 func TestClientServer_step(t *testing.T) {
+	protest.AllowRecording(t)
 	withTestClient2("testprog", t, func(c service.Client) {
-		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.helloworld", Line: 1})
+		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.helloworld", Line: -1})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -199,7 +227,26 @@ func TestClientServer_step(t *testing.T) {
 	})
 }
 
+func TestClientServer_stepout(t *testing.T) {
+	protest.AllowRecording(t)
+	withTestClient2("testnextprog", t, func(c service.Client) {
+		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.helloworld", Line: -1})
+		assertNoError(err, t, "CreateBreakpoint()")
+		stateBefore := <-c.Continue()
+		assertNoError(stateBefore.Err, t, "Continue()")
+		if stateBefore.CurrentThread.Line != 13 {
+			t.Fatalf("wrong line number %s:%d, expected %d", stateBefore.CurrentThread.File, stateBefore.CurrentThread.Line, 13)
+		}
+		stateAfter, err := c.StepOut()
+		assertNoError(err, t, "StepOut()")
+		if stateAfter.CurrentThread.Line != 35 {
+			t.Fatalf("wrong line number %s:%d, expected %d", stateAfter.CurrentThread.File, stateAfter.CurrentThread.Line, 13)
+		}
+	})
+}
+
 func testnext2(testcases []nextTest, initialLocation string, t *testing.T) {
+	protest.AllowRecording(t)
 	withTestClient2("testnextprog", t, func(c service.Client) {
 		bp, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: initialLocation, Line: -1})
 		if err != nil {
@@ -239,7 +286,7 @@ func TestNextGeneral(t *testing.T) {
 
 	ver, _ := proc.ParseVersionString(runtime.Version())
 
-	if ver.Major < 0 || ver.AfterOrEqual(proc.GoVersion{1, 7, -1, 0, 0}) {
+	if ver.Major < 0 || ver.AfterOrEqual(proc.GoVersion{1, 7, -1, 0, 0, ""}) {
 		testcases = []nextTest{
 			{17, 19},
 			{19, 20},
@@ -278,7 +325,7 @@ func TestNextGeneral(t *testing.T) {
 		}
 	}
 
-	testnext(testcases, "main.testnext", t)
+	testnext2(testcases, "main.testnext", t)
 }
 
 func TestNextFunctionReturn(t *testing.T) {
@@ -287,10 +334,11 @@ func TestNextFunctionReturn(t *testing.T) {
 		{14, 15},
 		{15, 35},
 	}
-	testnext(testcases, "main.helloworld", t)
+	testnext2(testcases, "main.helloworld", t)
 }
 
 func TestClientServer_breakpointInMainThread(t *testing.T) {
+	protest.AllowRecording(t)
 	withTestClient2("testprog", t, func(c service.Client) {
 		bp, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.helloworld", Line: 1})
 		if err != nil {
@@ -312,6 +360,7 @@ func TestClientServer_breakpointInMainThread(t *testing.T) {
 }
 
 func TestClientServer_breakpointInSeparateGoroutine(t *testing.T) {
+	protest.AllowRecording(t)
 	withTestClient2("testthreads", t, func(c service.Client) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.anotherthread", Line: 1})
 		if err != nil {
@@ -366,6 +415,7 @@ func TestClientServer_clearBreakpoint(t *testing.T) {
 }
 
 func TestClientServer_switchThread(t *testing.T) {
+	protest.AllowRecording(t)
 	withTestClient2("testnextprog", t, func(c service.Client) {
 		// With invalid thread id
 		_, err := c.SwitchThread(-1)
@@ -409,6 +459,7 @@ func TestClientServer_switchThread(t *testing.T) {
 }
 
 func TestClientServer_infoLocals(t *testing.T) {
+	protest.AllowRecording(t)
 	withTestClient2("testnextprog", t, func(c service.Client) {
 		fp := testProgPath(t, "testnextprog")
 		_, err := c.CreateBreakpoint(&api.Breakpoint{File: fp, Line: 23})
@@ -430,6 +481,7 @@ func TestClientServer_infoLocals(t *testing.T) {
 }
 
 func TestClientServer_infoArgs(t *testing.T) {
+	protest.AllowRecording(t)
 	withTestClient2("testnextprog", t, func(c service.Client) {
 		fp := testProgPath(t, "testnextprog")
 		_, err := c.CreateBreakpoint(&api.Breakpoint{File: fp, Line: 47})
@@ -440,11 +492,11 @@ func TestClientServer_infoArgs(t *testing.T) {
 		if state.Err != nil {
 			t.Fatalf("Unexpected error: %v, state: %#v", state.Err, state)
 		}
-		regs, err := c.ListRegisters()
+		regs, err := c.ListRegisters(0, false)
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
-		if regs == "" {
+		if len(regs) == 0 {
 			t.Fatal("Expected string showing registers values, got empty string")
 		}
 		locals, err := c.ListFunctionArgs(api.EvalScope{-1, 0}, normalLoadConfig)
@@ -458,6 +510,7 @@ func TestClientServer_infoArgs(t *testing.T) {
 }
 
 func TestClientServer_traceContinue(t *testing.T) {
+	protest.AllowRecording(t)
 	withTestClient2("integrationprog", t, func(c service.Client) {
 		fp := testProgPath(t, "integrationprog")
 		_, err := c.CreateBreakpoint(&api.Breakpoint{File: fp, Line: 15, Tracepoint: true, Goroutine: true, Stacktrace: 5, Variables: []string{"i"}})
@@ -515,6 +568,7 @@ func TestClientServer_traceContinue(t *testing.T) {
 }
 
 func TestClientServer_traceContinue2(t *testing.T) {
+	protest.AllowRecording(t)
 	withTestClient2("integrationprog", t, func(c service.Client) {
 		bp1, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main", Line: 1, Tracepoint: true})
 		if err != nil {
@@ -666,6 +720,18 @@ func TestClientServer_FindLocationsAddr(t *testing.T) {
 	})
 }
 
+func TestClientServer_FindLocationsExactMatch(t *testing.T) {
+	// if an expression matches multiple functions but one of them is an exact
+	// match it should be used anyway.
+	// In this example "math/rand.Intn" would normally match "math/rand.Intn"
+	// and "math/rand.(*Rand).Intn" but since the first match is exact it
+	// should be prioritized.
+	withTestClient2("locationsprog3", t, func(c service.Client) {
+		<-c.Continue()
+		findLocationHelper(t, c, "math/rand.Intn", false, 1, 0)
+	})
+}
+
 func TestClientServer_EvalVariable(t *testing.T) {
 	withTestClient2("testvariables", t, func(c service.Client) {
 		state := <-c.Continue()
@@ -708,6 +774,7 @@ func TestClientServer_SetVariable(t *testing.T) {
 }
 
 func TestClientServer_FullStacktrace(t *testing.T) {
+	protest.AllowRecording(t)
 	withTestClient2("goroutinestackprog", t, func(c service.Client) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.stacktraceme", Line: -1})
 		assertNoError(err, t, "CreateBreakpoint()")
@@ -734,7 +801,7 @@ func TestClientServer_FullStacktrace(t *testing.T) {
 					if arg.Name != "i" {
 						continue
 					}
-					t.Logf("frame %d, variable i is %v\n", arg)
+					t.Logf("frame %v, variable i is %v\n", frame, arg)
 					argn, err := strconv.Atoi(arg.Value)
 					if err == nil {
 						found[argn] = true
@@ -781,6 +848,7 @@ func TestClientServer_FullStacktrace(t *testing.T) {
 
 func TestIssue355(t *testing.T) {
 	// After the target process has terminated should return an error but not crash
+	protest.AllowRecording(t)
 	withTestClient2("continuetestprog", t, func(c service.Client) {
 		bp, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.sayhi", Line: -1})
 		assertNoError(err, t, "CreateBreakpoint()")
@@ -812,9 +880,13 @@ func TestIssue355(t *testing.T) {
 		_, err = c.Halt()
 		assertError(err, t, "Halt()")
 		_, err = c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main", Line: -1})
-		assertError(err, t, "CreateBreakpoint()")
+		if testBackend != "rr" {
+			assertError(err, t, "CreateBreakpoint()")
+		}
 		_, err = c.ClearBreakpoint(bp.ID)
-		assertError(err, t, "ClearBreakpoint()")
+		if testBackend != "rr" {
+			assertError(err, t, "ClearBreakpoint()")
+		}
 		_, err = c.ListThreads()
 		assertError(err, t, "ListThreads()")
 		_, err = c.GetThread(tid)
@@ -824,7 +896,7 @@ func TestIssue355(t *testing.T) {
 		assertError(err, t, "ListLocalVariables()")
 		_, err = c.ListFunctionArgs(api.EvalScope{gid, 0}, normalLoadConfig)
 		assertError(err, t, "ListFunctionArgs()")
-		_, err = c.ListRegisters()
+		_, err = c.ListRegisters(0, false)
 		assertError(err, t, "ListRegisters()")
 		_, err = c.ListGoroutines()
 		assertError(err, t, "ListGoroutines()")
@@ -944,6 +1016,7 @@ func TestDisasm(t *testing.T) {
 
 func TestNegativeStackDepthBug(t *testing.T) {
 	// After the target process has terminated should return an error but not crash
+	protest.AllowRecording(t)
 	withTestClient2("continuetestprog", t, func(c service.Client) {
 		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.sayhi", Line: -1})
 		assertNoError(err, t, "CreateBreakpoint()")
@@ -956,6 +1029,7 @@ func TestNegativeStackDepthBug(t *testing.T) {
 }
 
 func TestClientServer_CondBreakpoint(t *testing.T) {
+	protest.AllowRecording(t)
 	withTestClient2("parallel_next", t, func(c service.Client) {
 		bp, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.sayhi", Line: 1})
 		assertNoError(err, t, "CreateBreakpoint()")
@@ -1019,8 +1093,16 @@ func TestSkipPrologue2(t *testing.T) {
 
 		callme3 := findLocationHelper(t, c, "main.callme3", false, 1, 0)[0]
 		callme3Z := findLocationHelper(t, c, "main.callme3:0", false, 1, 0)[0]
-		// callme3 does not have local variables therefore the first line of the function is immediately after the prologue
-		findLocationHelper(t, c, "callme.go:18", false, 1, callme3Z)
+		ver, _ := proc.ParseVersionString(runtime.Version())
+		if ver.Major < 0 || ver.AfterOrEqual(proc.GoVer18Beta) {
+			findLocationHelper(t, c, "callme.go:19", false, 1, callme3)
+		} else {
+			// callme3 does not have local variables therefore the first line of the
+			// function is immediately after the prologue
+			// This is only true before 1.8 where frame pointer chaining introduced a
+			// bit of prologue even for functions without local variables
+			findLocationHelper(t, c, "callme.go:19", false, 1, callme3Z)
+		}
 		if callme3 == callme3Z {
 			t.Fatal("Skip prologue failed")
 		}
@@ -1045,6 +1127,7 @@ func TestIssue419(t *testing.T) {
 }
 
 func TestTypesCommand(t *testing.T) {
+	protest.AllowRecording(t)
 	withTestClient2("testvariables2", t, func(c service.Client) {
 		state := <-c.Continue()
 		assertNoError(state.Err, t, "Continue()")
@@ -1071,6 +1154,7 @@ func TestTypesCommand(t *testing.T) {
 }
 
 func TestIssue406(t *testing.T) {
+	protest.AllowRecording(t)
 	withTestClient2("issue406", t, func(c service.Client) {
 		locs, err := c.FindLocation(api.EvalScope{-1, 0}, "issue406.go:146")
 		assertNoError(err, t, "FindLocation()")
@@ -1111,7 +1195,7 @@ func TestClientServer_Issue528(t *testing.T) {
 	// f744717d1924340b8f5e5a385e99078693ad9097
 
 	ver, _ := proc.ParseVersionString(runtime.Version())
-	if ver.Major > 0 && !ver.AfterOrEqual(proc.GoVersion{1, 7, -1, 0, 0}) {
+	if ver.Major > 0 && !ver.AfterOrEqual(proc.GoVersion{1, 7, -1, 0, 0, ""}) {
 		t.Log("Test skipped")
 		return
 	}
@@ -1119,4 +1203,135 @@ func TestClientServer_Issue528(t *testing.T) {
 	withTestClient2("issue528", t, func(c service.Client) {
 		findLocationHelper(t, c, "State.Close", false, 1, 0)
 	})
+}
+
+func TestClientServer_FpRegisters(t *testing.T) {
+	regtests := []struct{ name, value string }{
+		{"ST(0)", "0x3fffe666660000000000"},
+		{"ST(1)", "0x3fffd9999a0000000000"},
+		{"ST(2)", "0x3fffcccccd0000000000"},
+		{"ST(3)", "0x3fffc000000000000000"},
+		{"ST(4)", "0x3fffb333333333333000"},
+		{"ST(5)", "0x3fffa666666666666800"},
+		{"ST(6)", "0x3fff9999999999999800"},
+		{"ST(7)", "0x3fff8cccccccccccd000"},
+		{"XMM0", "0x3ff33333333333333ff199999999999a	v2_int={ 3ff199999999999a 3ff3333333333333 }	v4_int={ 9999999a 3ff19999 33333333 3ff33333 }	v8_int={ 999a 9999 9999 3ff1 3333 3333 3333 3ff3 }	v16_int={ 9a 99 99 99 99 99 f1 3f 33 33 33 33 33 33 f3 3f }"},
+		{"XMM1", "0x3ff66666666666663ff4cccccccccccd"},
+		{"XMM2", "0x3fe666663fd9999a3fcccccd3fc00000"},
+		{"XMM3", "0x3ff199999999999a3ff3333333333333"},
+		{"XMM4", "0x3ff4cccccccccccd3ff6666666666666"},
+		{"XMM5", "0x3fcccccd3fc000003fe666663fd9999a"},
+		{"XMM6", "0x4004cccccccccccc4003333333333334"},
+		{"XMM7", "0x40026666666666664002666666666666"},
+		{"XMM8", "0x4059999a404ccccd4059999a404ccccd"},
+	}
+	protest.AllowRecording(t)
+	withTestClient2("fputest/", t, func(c service.Client) {
+		<-c.Continue()
+		regs, err := c.ListRegisters(0, true)
+		assertNoError(err, t, "ListRegisters()")
+
+		t.Logf("%s", regs.String())
+
+		for _, regtest := range regtests {
+			found := false
+			for _, reg := range regs {
+				if reg.Name == regtest.name {
+					found = true
+					if !strings.HasPrefix(reg.Value, regtest.value) {
+						t.Fatalf("register %s expected %q got %q", reg.Name, regtest.value, reg.Value)
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("register %s not found: %v", regtest.name, regs)
+			}
+		}
+	})
+}
+
+func TestClientServer_RestartBreakpointPosition(t *testing.T) {
+	protest.AllowRecording(t)
+	withTestClient2("locationsprog2", t, func(c service.Client) {
+		bpBefore, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.afunction", Line: -1, Tracepoint: true, Name: "this"})
+		addrBefore := bpBefore.Addr
+		t.Logf("%x\n", bpBefore.Addr)
+		assertNoError(err, t, "CreateBreakpoint")
+		stateCh := c.Continue()
+		for range stateCh {
+		}
+		_, err = c.Halt()
+		assertNoError(err, t, "Halt")
+		_, err = c.Restart()
+		assertNoError(err, t, "Restart")
+		bps, err := c.ListBreakpoints()
+		assertNoError(err, t, "ListBreakpoints")
+		for _, bp := range bps {
+			if bp.Name == bpBefore.Name {
+				if bp.Addr != addrBefore {
+					t.Fatalf("Address changed after restart: %x %x", bp.Addr, addrBefore)
+				}
+				t.Logf("%x %x\n", bp.Addr, addrBefore)
+			}
+		}
+	})
+}
+
+func TestClientServer_SelectedGoroutineLoc(t *testing.T) {
+	// CurrentLocation of SelectedGoroutine should reflect what's happening on
+	// the thread running the goroutine, not the position the goroutine was in
+	// the last time it was parked.
+	protest.AllowRecording(t)
+	withTestClient2("testprog", t, func(c service.Client) {
+		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main", Line: -11})
+		assertNoError(err, t, "CreateBreakpoint")
+
+		s := <-c.Continue()
+		assertNoError(s.Err, t, "Continue")
+
+		gloc := s.SelectedGoroutine.CurrentLoc
+
+		if gloc.PC != s.CurrentThread.PC {
+			t.Errorf("mismatched PC %#x %#x", gloc.PC, s.CurrentThread.PC)
+		}
+
+		if gloc.File != s.CurrentThread.File || gloc.Line != s.CurrentThread.Line {
+			t.Errorf("mismatched file:lineno: %s:%d %s:%d", gloc.File, gloc.Line, s.CurrentThread.File, s.CurrentThread.Line)
+		}
+	})
+}
+
+func TestClientServer_ReverseContinue(t *testing.T) {
+	protest.AllowRecording(t)
+	if testBackend != "rr" {
+		t.Skip("backend is not rr")
+	}
+	withTestClient2("continuetestprog", t, func(c service.Client) {
+		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.main", Line: -1})
+		assertNoError(err, t, "CreateBreakpoint(main.main)")
+		_, err = c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.sayhi", Line: -1})
+		assertNoError(err, t, "CreateBreakpoint(main.sayhi)")
+
+		state := <-c.Continue()
+		assertNoError(state.Err, t, "first continue")
+		mainPC := state.CurrentThread.PC
+		t.Logf("after first continue %#x", mainPC)
+
+		state = <-c.Continue()
+		assertNoError(state.Err, t, "second continue")
+		sayhiPC := state.CurrentThread.PC
+		t.Logf("after second continue %#x", sayhiPC)
+
+		if mainPC == sayhiPC {
+			t.Fatalf("expected different PC after second PC (%#x)", mainPC)
+		}
+
+		state = <-c.Rewind()
+		assertNoError(state.Err, t, "rewind")
+
+		if mainPC != state.CurrentThread.PC {
+			t.Fatalf("Expected rewind to go back to the first breakpoint: %#x", state.CurrentThread.PC)
+		}
+	})
+
 }

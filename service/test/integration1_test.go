@@ -1,4 +1,4 @@
-package servicetest
+package service_test
 
 import (
 	"fmt"
@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	protest "github.com/derekparker/delve/proc/test"
+	protest "github.com/derekparker/delve/pkg/proc/test"
 
-	"github.com/derekparker/delve/proc"
+	"github.com/derekparker/delve/pkg/proc"
 	"github.com/derekparker/delve/service"
 	"github.com/derekparker/delve/service/api"
 	"github.com/derekparker/delve/service/rpc1"
@@ -21,6 +21,9 @@ import (
 )
 
 func withTestClient1(name string, t *testing.T, fn func(c *rpc1.RPCClient)) {
+	if testBackend == "rr" {
+		protest.MustHaveRecordingAllowed(t)
+	}
 	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("couldn't start listener: %s\n", err)
@@ -29,6 +32,7 @@ func withTestClient1(name string, t *testing.T, fn func(c *rpc1.RPCClient)) {
 	server := rpccommon.NewServer(&service.Config{
 		Listener:    listener,
 		ProcessArgs: []string{protest.BuildFixture(name).Path},
+		Backend:     testBackend,
 	}, false)
 	if err := server.Run(); err != nil {
 		t.Fatal(err)
@@ -42,6 +46,12 @@ func withTestClient1(name string, t *testing.T, fn func(c *rpc1.RPCClient)) {
 }
 
 func Test1RunWithInvalidPath(t *testing.T) {
+	if testBackend == "rr" {
+		// This test won't work because rr returns an error, after recording, when
+		// the recording failed but also when the recording succeeded but the
+		// inferior returned an error. Therefore we have to ignore errors from rr.
+		return
+	}
 	listener, err := net.Listen("tcp", "localhost:0")
 	if err != nil {
 		t.Fatalf("couldn't start listener: %s\n", err)
@@ -50,6 +60,7 @@ func Test1RunWithInvalidPath(t *testing.T) {
 	server := rpccommon.NewServer(&service.Config{
 		Listener:    listener,
 		ProcessArgs: []string{"invalid_path"},
+		Backend:     testBackend,
 	}, false)
 	if err := server.Run(); err == nil {
 		t.Fatal("Expected Run to return error for invalid program path")
@@ -138,6 +149,7 @@ func Test1Restart_attachPid(t *testing.T) {
 	server := rpccommon.NewServer(&service.Config{
 		Listener:  nil,
 		AttachPid: 999,
+		Backend:   testBackend,
 	}, false)
 	if err := server.Restart(); err == nil {
 		t.Fatal("expected error on restart after attaching to pid but got none")
@@ -169,7 +181,7 @@ func Test1ClientServer_exit(t *testing.T) {
 
 func Test1ClientServer_step(t *testing.T) {
 	withTestClient1("testprog", t, func(c *rpc1.RPCClient) {
-		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.helloworld", Line: 1})
+		_, err := c.CreateBreakpoint(&api.Breakpoint{FunctionName: "main.helloworld", Line: -1})
 		if err != nil {
 			t.Fatalf("Unexpected error: %v", err)
 		}
@@ -230,7 +242,7 @@ func Test1NextGeneral(t *testing.T) {
 
 	ver, _ := proc.ParseVersionString(runtime.Version())
 
-	if ver.Major < 0 || ver.AfterOrEqual(proc.GoVersion{1, 7, -1, 0, 0}) {
+	if ver.Major < 0 || ver.AfterOrEqual(proc.GoVersion{1, 7, -1, 0, 0, ""}) {
 		testcases = []nextTest{
 			{17, 19},
 			{19, 20},
@@ -1010,8 +1022,16 @@ func Test1SkipPrologue2(t *testing.T) {
 
 		callme3 := findLocationHelper(t, c, "main.callme3", false, 1, 0)[0]
 		callme3Z := findLocationHelper(t, c, "main.callme3:0", false, 1, 0)[0]
-		// callme3 does not have local variables therefore the first line of the function is immediately after the prologue
-		findLocationHelper(t, c, "callme.go:18", false, 1, callme3Z)
+		ver, _ := proc.ParseVersionString(runtime.Version())
+		if ver.Major < 0 || ver.AfterOrEqual(proc.GoVer18Beta) {
+			findLocationHelper(t, c, "callme.go:19", false, 1, callme3)
+		} else {
+			// callme3 does not have local variables therefore the first line of the
+			// function is immediately after the prologue
+			// This is only true before 1.8 where frame pointer chaining introduced a
+			// bit of prologue even for functions without local variables
+			findLocationHelper(t, c, "callme.go:19", false, 1, callme3Z)
+		}
 		if callme3 == callme3Z {
 			t.Fatal("Skip prologue failed")
 		}

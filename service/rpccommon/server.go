@@ -1,6 +1,7 @@
 package rpccommon
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -10,16 +11,17 @@ import (
 	"net/rpc"
 	"net/rpc/jsonrpc"
 	"reflect"
+	"runtime"
 	"sync"
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/derekparker/delve/pkg/version"
 	"github.com/derekparker/delve/service"
 	"github.com/derekparker/delve/service/api"
 	"github.com/derekparker/delve/service/debugger"
 	"github.com/derekparker/delve/service/rpc1"
 	"github.com/derekparker/delve/service/rpc2"
-	"github.com/derekparker/delve/version"
 )
 
 // ServerImpl implements a JSON-RPC server that can switch between two
@@ -111,6 +113,9 @@ func (s *ServerImpl) Run() error {
 	if s.debugger, err = debugger.New(&debugger.Config{
 		ProcessArgs: s.config.ProcessArgs,
 		AttachPid:   s.config.AttachPid,
+		WorkingDir:  s.config.WorkingDir,
+		CoreFile:    s.config.CoreFile,
+		Backend:     s.config.Backend,
 	}); err != nil {
 		return err
 	}
@@ -284,8 +289,18 @@ func (s *ServerImpl) serveJSONCodec(conn io.ReadWriteCloser) {
 		if mtype.Synchronous {
 			replyv = reflect.New(mtype.ReplyType.Elem())
 			function := mtype.method.Func
-			returnValues := function.Call([]reflect.Value{mtype.Rcvr, argv, replyv})
-			errInter := returnValues[0].Interface()
+			var returnValues []reflect.Value
+			var errInter interface{}
+			func() {
+				defer func() {
+					if ierr := recover(); ierr != nil {
+						errInter = newInternalError(ierr, 2)
+					}
+				}()
+				returnValues = function.Call([]reflect.Value{mtype.Rcvr, argv, replyv})
+				errInter = returnValues[0].Interface()
+			}()
+
 			errmsg := ""
 			if errInter != nil {
 				errmsg = errInter.(error).Error()
@@ -295,7 +310,14 @@ func (s *ServerImpl) serveJSONCodec(conn io.ReadWriteCloser) {
 		} else {
 			function := mtype.method.Func
 			ctl := &RPCCallback{s, sending, codec, req}
-			go function.Call([]reflect.Value{mtype.Rcvr, argv, reflect.ValueOf(ctl)})
+			go func() {
+				defer func() {
+					if ierr := recover(); ierr != nil {
+						ctl.Return(nil, newInternalError(ierr, 2))
+					}
+				}()
+				function.Call([]reflect.Value{mtype.Rcvr, argv, reflect.ValueOf(ctl)})
+			}()
 		}
 	}
 	codec.Close()
@@ -348,4 +370,42 @@ func (s *RPCServer) SetApiVersion(args api.SetAPIVersionIn, out *api.SetAPIVersi
 	}
 	s.s.config.APIVersion = args.APIVersion
 	return nil
+}
+
+type internalError struct {
+	Err   interface{}
+	Stack []internalErrorFrame
+}
+
+type internalErrorFrame struct {
+	Pc   uintptr
+	Func string
+	File string
+	Line int
+}
+
+func newInternalError(ierr interface{}, skip int) *internalError {
+	r := &internalError{ierr, nil}
+	for i := skip; ; i++ {
+		pc, file, line, ok := runtime.Caller(i)
+		if !ok {
+			break
+		}
+		fname := "<unknown>"
+		fn := runtime.FuncForPC(pc)
+		if fn != nil {
+			fname = fn.Name()
+		}
+		r.Stack = append(r.Stack, internalErrorFrame{pc, fname, file, line})
+	}
+	return r
+}
+
+func (err *internalError) Error() string {
+	var out bytes.Buffer
+	fmt.Fprintf(&out, "Internal debugger error: %v\n", err.Err)
+	for _, frame := range err.Stack {
+		fmt.Fprintf(&out, "%s (%#x)\n\t%s:%d\n", frame.Func, frame.Pc, frame.File, frame.Line)
+	}
+	return out.String()
 }

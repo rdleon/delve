@@ -3,6 +3,7 @@ package rpc2
 import (
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/derekparker/delve/service"
 	"github.com/derekparker/delve/service/api"
@@ -33,6 +34,18 @@ func (s *RPCServer) ProcessPid(arg ProcessPidIn, out *ProcessPidOut) error {
 	return nil
 }
 
+type LastModifiedIn struct {
+}
+
+type LastModifiedOut struct {
+	Time time.Time
+}
+
+func (s *RPCServer) LastModified(arg LastModifiedIn, out *LastModifiedOut) error {
+	out.Time = s.debugger.LastModified()
+	return nil
+}
+
 type DetachIn struct {
 	Kill bool
 }
@@ -46,9 +59,13 @@ func (s *RPCServer) Detach(arg DetachIn, out *DetachOut) error {
 }
 
 type RestartIn struct {
+	// Position to restart from, if it starts with 'c' it's a checkpoint ID,
+	// otherwise it's an event number. Only valid for recorded targets.
+	Position string
 }
 
 type RestartOut struct {
+	DiscardedBreakpoints []api.DiscardedBreakpoint
 }
 
 // Restart restarts program.
@@ -56,7 +73,9 @@ func (s *RPCServer) Restart(arg RestartIn, out *RestartOut) error {
 	if s.config.AttachPid != 0 {
 		return errors.New("cannot restart process Delve did not create")
 	}
-	return s.debugger.Restart()
+	var err error
+	out.DiscardedBreakpoints, err = s.debugger.Restart(arg.Position)
+	return err
 }
 
 type StateIn struct {
@@ -312,24 +331,32 @@ func (s *RPCServer) ListPackageVars(arg ListPackageVarsIn, out *ListPackageVarsO
 }
 
 type ListRegistersIn struct {
+	ThreadID  int
+	IncludeFp bool
 }
 
 type ListRegistersOut struct {
 	Registers string
+	Regs      api.Registers
 }
 
 // ListRegisters lists registers and their values.
 func (s *RPCServer) ListRegisters(arg ListRegistersIn, out *ListRegistersOut) error {
-	state, err := s.debugger.State()
-	if err != nil {
-		return err
+	if arg.ThreadID == 0 {
+		state, err := s.debugger.State()
+		if err != nil {
+			return err
+		}
+		arg.ThreadID = state.CurrentThread.ID
 	}
 
-	regs, err := s.debugger.Registers(state.CurrentThread.ID)
+	regs, err := s.debugger.Registers(arg.ThreadID, arg.IncludeFp)
 	if err != nil {
 		return err
 	}
-	out.Registers = regs
+	out.Regs = regs
+	out.Registers = out.Regs.String()
+
 	return nil
 }
 
@@ -548,4 +575,55 @@ func (c *RPCServer) Disassemble(arg DisassembleIn, out *DisassembleOut) error {
 	var err error
 	out.Disassemble, err = c.debugger.Disassemble(arg.Scope, arg.StartPC, arg.EndPC, arg.Flavour)
 	return err
+}
+
+type RecordedIn struct {
+}
+
+type RecordedOut struct {
+	Recorded       bool
+	TraceDirectory string
+}
+
+func (s *RPCServer) Recorded(arg RecordedIn, out *RecordedOut) error {
+	out.Recorded, out.TraceDirectory = s.debugger.Recorded()
+	return nil
+}
+
+type CheckpointIn struct {
+	Where string
+}
+
+type CheckpointOut struct {
+	ID int
+}
+
+func (s *RPCServer) Checkpoint(arg CheckpointIn, out *CheckpointOut) error {
+	var err error
+	out.ID, err = s.debugger.Checkpoint(arg.Where)
+	return err
+}
+
+type ListCheckpointsIn struct {
+}
+
+type ListCheckpointsOut struct {
+	Checkpoints []api.Checkpoint
+}
+
+func (s *RPCServer) ListCheckpoints(arg ListCheckpointsIn, out *ListCheckpointsOut) error {
+	var err error
+	out.Checkpoints, err = s.debugger.Checkpoints()
+	return err
+}
+
+type ClearCheckpointIn struct {
+	ID int
+}
+
+type ClearCheckpointOut struct {
+}
+
+func (s *RPCServer) ClearCheckpoint(arg ClearCheckpointIn, out *ClearCheckpointOut) error {
+	return s.debugger.ClearCheckpoint(arg.ID)
 }
